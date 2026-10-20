@@ -1,16 +1,75 @@
 mod pyrsutils;
 use pyrsutils::prelude::*;
 
+use iced::alignment::Vertical;
+use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input};
+use iced::{Element, Fill, Font, Size, Task, Theme};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 const APP_NAME: &str = "Prince of Persia - DAT/CFG Inspector";
 const MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
 const BYTES_PER_ROW: usize = 16;
-const LINHAS_POR_PAGINA: usize = 30;
+const LINHAS_POR_PAGINA: usize = 400;
+const MAX_LINHA: usize = 512;
 const EXTENSOES: [&str; 8] = [".dat", ".cfg", ".exe", ".com", ".bat", ".dll", ".bin", ".wad"];
 const ENCODINGS: [&str; 4] = ["cp437", "latin-1", "utf-8", "ascii"];
 
 const CP437_ALTO: &str = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αß\u{0393}π\u{03A3}σ\u{00B5}τ\u{03A6}\u{0398}\u{03A9}δ∞φε∩≡±≥≤⌠⌡÷≈°\u{2219}\u{00B7}√ⁿ²■\u{00A0}";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Modo {
+    Hex,
+    Texto,
+}
+
+impl fmt::Display for Modo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Modo::Hex => write!(f, "HEX"),
+            Modo::Texto => write!(f, "Texto"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Enc(usize);
+
+impl fmt::Display for Enc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", ENCODINGS[self.0])
+    }
+}
+
+static MODOS: [Modo; 2] = [Modo::Hex, Modo::Texto];
+static ENCS: [Enc; 4] = [Enc(0), Enc(1), Enc(2), Enc(3)];
+
+#[derive(Debug, Clone, Copy)]
+enum Nav {
+    Inicio,
+    Anterior,
+    Proxima,
+    Fim,
+}
+
+#[derive(Debug, Clone)]
+enum Msg {
+    AbrirArquivo,
+    ArquivoEscolhido(Option<PathBuf>),
+    AbrirPasta,
+    PastaEscolhida(Option<PathBuf>),
+    Escolher(usize),
+    CancelarLista,
+    Info,
+    Strings,
+    BuscarTexto,
+    BuscarHex,
+    Query(String),
+    Modo(Modo),
+    Codificacao(Enc),
+    Nav(Nav),
+    FecharAviso,
+}
 
 enum Saida {
     Vazia,
@@ -21,29 +80,14 @@ enum Saida {
 struct App {
     path: Option<PathBuf>,
     data: Vec<u8>,
-    hex: bool,
+    modo: Modo,
     enc: usize,
     query: String,
     status: String,
     saida: Saida,
-}
-
-fn ler(prompt: &str) -> String {
-    match try_input::<String>(prompt) {
-        Ok(s) => s,
-        Err(_) => {
-            print("");
-            std::process::exit(0);
-        }
-    }
-}
-
-fn aviso(titulo: &str, msg: &str) {
-    print(format!("[{titulo}] {msg}"));
-}
-
-fn erro(titulo: &str, msg: &str) {
-    print(format!("[ERRO] {titulo}: {msg}"));
+    ini: usize,
+    lista: Option<Vec<(PathBuf, String)>>,
+    aviso: Option<(String, String)>,
 }
 
 fn milhares(n: u64) -> String {
@@ -56,11 +100,6 @@ fn milhares(n: u64) -> String {
         r.push(c);
     }
     r
-}
-
-fn limpar_caminho(entrada: &str) -> String {
-    let s = strip(entrada).trim_matches(|c| c == '"' || c == '\'');
-    expanduser(strip(s))
 }
 
 fn ext_ok(p: &Path) -> bool {
@@ -111,11 +150,7 @@ fn codificar(texto: &str, enc: usize) -> Result<Vec<u8>, String> {
         };
         match byte {
             Some(b) => out.push(b),
-            None => {
-                return Err(format!(
-                    "'{nome}' codec can't encode character {c:?}"
-                ))
-            }
+            None => return Err(format!("'{nome}' codec can't encode character {c:?}")),
         }
     }
     Ok(out)
@@ -128,8 +163,10 @@ fn sanear(texto: &str) -> String {
         if c == '\r' && it.peek() == Some(&'\n') {
             continue;
         }
-        if c == '\n' || c == '\t' {
+        if c == '\n' {
             s.push(c);
+        } else if c == '\t' {
+            s.push_str("    ");
         } else if c.is_control() {
             s.push('\u{00B7}');
         } else {
@@ -137,6 +174,21 @@ fn sanear(texto: &str) -> String {
         }
     }
     s
+}
+
+fn quebrar(texto: &str) -> Vec<String> {
+    let mut v = Vec::new();
+    for l in texto.split('\n') {
+        if l.len() <= MAX_LINHA {
+            v.push(l.to_string());
+        } else {
+            let cs: Vec<char> = l.chars().collect();
+            for pedaco in cs.chunks(MAX_LINHA) {
+                v.push(pedaco.iter().collect());
+            }
+        }
+    }
+    v
 }
 
 fn total_hex(data: &[u8]) -> usize {
@@ -166,35 +218,6 @@ fn linha_hex(data: &[u8], i: usize) -> String {
         .map(|&b| if (32..=126).contains(&b) { b as char } else { '.' })
         .collect();
     format!("{offset:08X}  {hex_part:<47}  {ascii_part}")
-}
-
-fn paginar(total: usize, linha: &dyn Fn(usize) -> String) {
-    if total == 0 {
-        return;
-    }
-    let mut ini = 0usize;
-    loop {
-        let fim = (ini + LINHAS_POR_PAGINA).min(total);
-        for i in ini..fim {
-            print(linha(i));
-        }
-        let resp = ler(&format!(
-            "-- linhas {}-{} de {} -- [Enter]=próxima  [a]=anterior  [q]=sair: ",
-            ini + 1,
-            fim,
-            total
-        ));
-        match lower(strip(&resp)).as_str() {
-            "q" => return,
-            "a" => ini = ini.saturating_sub(LINHAS_POR_PAGINA),
-            _ => {
-                if fim >= total {
-                    return;
-                }
-                ini = fim;
-            }
-        }
-    }
 }
 
 fn find_strings(data: &[u8], minimum: usize) -> Vec<(usize, String)> {
@@ -260,149 +283,103 @@ fn parse_hex(query: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+fn extensoes_dialogo() -> Vec<String> {
+    let mut v = Vec::new();
+    for e in EXTENSOES.iter() {
+        let s = e.trim_start_matches('.');
+        v.push(s.to_string());
+        v.push(upper(s));
+    }
+    v
+}
+
 impl App {
     fn new() -> Self {
         App {
             path: None,
             data: Vec::new(),
-            hex: true,
+            modo: Modo::Hex,
             enc: 0,
             query: String::new(),
             status: "Abra um arquivo (.DAT, .CFG, .EXE, .COM, .BAT, .DLL, .BIN, .WAD).".to_string(),
             saida: Saida::Vazia,
+            ini: 0,
+            lista: None,
+            aviso: None,
         }
     }
 
-    fn mostrar(&self) {
-        match &self.saida {
-            Saida::Vazia => print("(sem saída)"),
-            Saida::Hex => {
-                let d = &self.data;
-                paginar(total_hex(d), &|i| linha_hex(d, i));
-            }
-            Saida::Linhas(v) => paginar(v.len(), &|i| v[i].clone()),
-        }
+    fn title(&self) -> String {
+        APP_NAME.to_string()
+    }
+
+    fn theme(&self) -> Theme {
+        Theme::Dark
+    }
+
+    fn avisar(&mut self, titulo: &str, msg: impl Into<String>) {
+        self.aviso = Some((titulo.to_string(), msg.into()));
     }
 
     fn set_output(&mut self, linhas: Vec<String>) {
         self.saida = Saida::Linhas(linhas);
+        self.ini = 0;
+        self.lista = None;
     }
 
     fn render(&mut self) {
         if self.path.is_none() {
             return;
         }
-        if self.hex {
-            self.saida = Saida::Hex;
-        } else {
-            let texto = sanear(&decodificar(&self.data, self.enc));
-            self.saida = Saida::Linhas(texto.split('\n').map(String::from).collect());
-        }
-        self.mostrar();
-    }
-
-    fn cabecalho(&self) {
-        let caminho = match &self.path {
-            Some(p) => p.display().to_string(),
-            None => "Nenhum arquivo aberto".to_string(),
-        };
-        print("");
-        print("=".repeat(70));
-        print(APP_NAME);
-        print("=".repeat(70));
-        print(format!("Arquivo      : {caminho}"));
-        print(format!(
-            "Visualização : {}    Codificação: {}",
-            if self.hex { "HEX" } else { "Texto" },
-            ENCODINGS[self.enc]
-        ));
-        print(format!("Status       : {}", self.status));
-        print("-".repeat(70));
-        print("1) Abrir arquivo        6) Codificação");
-        print("2) Abrir pasta          7) Buscar texto");
-        print("3) Informações          8) Buscar HEX");
-        print("4) Extrair strings      9) Exibir saída atual");
-        print("5) Visualização         0) Sair");
-    }
-
-    fn open_file(&mut self) {
-        let entrada = ler("Caminho do arquivo (Enter cancela): ");
-        let caminho = limpar_caminho(&entrada);
-        if caminho.is_empty() {
-            return;
-        }
-        self.load_file(PathBuf::from(caminho));
-    }
-
-    fn open_folder(&mut self) {
-        let entrada = ler("Pasta do jogo (Enter cancela): ");
-        let pasta = limpar_caminho(&entrada);
-        if pasta.is_empty() {
-            return;
-        }
-
-        let lista: Vec<PathBuf> = match std::fs::read_dir(&pasta) {
-            Ok(rd) => rd
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_file() && ext_ok(p))
-                .collect(),
-            Err(e) => {
-                erro("Pasta", &e.to_string());
-                return;
-            }
-        };
-        let files = sorted(lista);
-
-        if files.is_empty() {
-            aviso(
-                "Arquivos",
-                "Nenhum arquivo .DAT, .CFG, .EXE, .COM, .BAT, .DLL, .BIN ou .WAD encontrado.",
-            );
-            return;
-        }
-
-        print("");
-        print("Arquivos encontrados:");
-        for (i, p) in enumerate(files.iter()) {
-            let nome = basename(p);
-            match p.metadata() {
-                Ok(m) => print(format!("{:>4}) {nome}  ({} bytes)", i + 1, milhares(m.len()))),
-                Err(_) => print(format!("{:>4}) {nome}", i + 1)),
+        self.lista = None;
+        self.ini = 0;
+        match self.modo {
+            Modo::Hex => self.saida = Saida::Hex,
+            Modo::Texto => {
+                let texto = sanear(&decodificar(&self.data, self.enc));
+                self.saida = Saida::Linhas(quebrar(&texto));
             }
         }
+    }
 
-        let escolha = ler("Número do arquivo a abrir (Enter cancela): ");
-        let escolha = strip(&escolha);
-        if escolha.is_empty() {
-            return;
+    fn total(&self) -> usize {
+        match &self.saida {
+            Saida::Vazia => 0,
+            Saida::Hex => total_hex(&self.data),
+            Saida::Linhas(v) => v.len(),
         }
-        match escolha.parse::<usize>() {
-            Ok(n) if n >= 1 && n <= len(&files) => {
-                self.load_file(files[n - 1].clone());
-            }
-            _ => aviso("Arquivos", "Seleção inválida."),
+    }
+
+    fn pagina_texto(&self) -> String {
+        let total = self.total();
+        let fim = (self.ini + LINHAS_POR_PAGINA).min(total);
+        match &self.saida {
+            Saida::Vazia => String::new(),
+            Saida::Hex => join("\n", (self.ini..fim).map(|i| linha_hex(&self.data, i))),
+            Saida::Linhas(v) => join("\n", v[self.ini..fim].iter()),
         }
     }
 
     fn load_file(&mut self, path: PathBuf) {
+        self.lista = None;
+
         let size = match std::fs::metadata(&path) {
             Ok(m) => m.len(),
             Err(e) => {
-                erro("Erro de leitura", &e.to_string());
+                self.avisar("Erro de leitura", e.to_string());
                 return;
             }
         };
 
         if size > MAX_FILE_SIZE {
-            erro("Arquivo muito grande", "O limite desta versão é 256 MiB.");
+            self.avisar("Arquivo muito grande", "O limite desta versão é 256 MiB.");
             return;
         }
 
         let data = match std::fs::read(&path) {
             Ok(d) => d,
             Err(e) => {
-                erro("Erro de leitura", &e.to_string());
+                self.avisar("Erro de leitura", e.to_string());
                 return;
             }
         };
@@ -413,14 +390,55 @@ impl App {
         );
         self.path = Some(path);
         self.data = data;
+        self.aviso = None;
         self.render();
     }
 
-    fn show_info(&self) {
+    fn listar_pasta(&mut self, pasta: PathBuf) {
+        let rd = match std::fs::read_dir(&pasta) {
+            Ok(rd) => rd,
+            Err(e) => {
+                self.avisar("Pasta", e.to_string());
+                return;
+            }
+        };
+
+        let files = sorted(
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && ext_ok(p))
+                .collect::<Vec<PathBuf>>(),
+        );
+
+        if files.is_empty() {
+            self.avisar(
+                "Arquivos",
+                "Nenhum arquivo .DAT, .CFG, .EXE, .COM, .BAT, .DLL, .BIN ou .WAD encontrado.",
+            );
+            return;
+        }
+
+        let itens: Vec<(PathBuf, String)> = files
+            .into_iter()
+            .map(|p| {
+                let nome = basename(&p);
+                let rotulo = match p.metadata() {
+                    Ok(m) => format!("{nome}  ({} bytes)", milhares(m.len())),
+                    Err(_) => nome,
+                };
+                (p, rotulo)
+            })
+            .collect();
+
+        self.lista = Some(itens);
+        self.aviso = None;
+    }
+
+    fn show_info(&mut self) {
         let path = match &self.path {
-            Some(p) => p,
+            Some(p) => p.clone(),
             None => {
-                aviso("Informações", "Abra um arquivo primeiro.");
+                self.avisar("Informações", "Abra um arquivo primeiro.");
                 return;
             }
         };
@@ -441,22 +459,22 @@ impl App {
         }
         let distintos = vistos.iter().filter(|&&v| v).count();
 
-        print("");
-        print(format!("Nome: {}", basename(path)));
-        print(format!("Caminho: {}", path.display()));
-        print(format!("Extensão: {}", splitext(path).1));
-        print(format!("Tamanho: {} bytes", milhares(data.len() as u64)));
-        print(format!("Bytes distintos: {distintos}/256"));
-        print(format!(
-            "Bytes ASCII imprimíveis/controles comuns: {ratio:.1}%"
-        ));
-        print("");
-        print("Essa proporção é apenas indicativa; não identifica sozinha o formato do arquivo.");
+        let info = format!(
+            "Nome: {}\nCaminho: {}\nExtensão: {}\nTamanho: {} bytes\nBytes distintos: {}/256\nBytes ASCII imprimíveis/controles comuns: {:.1}%\n\nEssa proporção é apenas indicativa; não identifica sozinha o formato do arquivo.",
+            basename(&path),
+            path.display(),
+            splitext(&path).1,
+            milhares(data.len() as u64),
+            distintos,
+            ratio
+        );
+
+        self.avisar("Informações", info);
     }
 
     fn extract_strings(&mut self) {
         if self.path.is_none() {
-            aviso("Strings", "Abra um arquivo primeiro.");
+            self.avisar("Strings", "Abra um arquivo primeiro.");
             return;
         }
 
@@ -479,29 +497,15 @@ impl App {
 
         self.set_output(lines);
         self.status = format!("{} strings ASCII encontradas.", results.len());
-        self.mostrar();
-    }
-
-    fn pedir_consulta(&mut self, rotulo: &str) -> String {
-        let msg = if self.query.is_empty() {
-            format!("{rotulo}: ")
-        } else {
-            format!("{rotulo} [{}]: ", self.query)
-        };
-        let entrada = ler(&msg);
-        if !entrada.is_empty() {
-            self.query = entrada;
-        }
-        self.query.clone()
     }
 
     fn search_text(&mut self) {
         if self.path.is_none() {
-            aviso("Pesquisa", "Abra um arquivo primeiro.");
+            self.avisar("Pesquisa", "Abra um arquivo primeiro.");
             return;
         }
 
-        let query = self.pedir_consulta("Texto a buscar (ex.: PRINCE)");
+        let query = self.query.clone();
         if query.is_empty() {
             return;
         }
@@ -509,7 +513,7 @@ impl App {
         let needle = match codificar(&query, self.enc) {
             Ok(n) => n,
             Err(m) => {
-                erro("Codificação", &m);
+                self.avisar("Codificação", m);
                 return;
             }
         };
@@ -524,17 +528,16 @@ impl App {
 
     fn search_hex(&mut self) {
         if self.path.is_none() {
-            aviso("Pesquisa HEX", "Abra um arquivo primeiro.");
+            self.avisar("Pesquisa HEX", "Abra um arquivo primeiro.");
             return;
         }
 
-        let bruto = self.pedir_consulta("HEX a buscar (ex.: 50 52 49 4E 43 45)");
-        let query = strip(&bruto);
+        let query = self.query.clone();
 
-        let needle = match parse_hex(query) {
+        let needle = match parse_hex(strip(&query)) {
             Some(n) => n,
             None => {
-                erro("HEX inválido", "Use, por exemplo: 50 52 49 4E 43 45");
+                self.avisar("HEX inválido", "Use, por exemplo: 50 52 49 4E 43 45");
                 return;
             }
         };
@@ -571,61 +574,234 @@ impl App {
 
         self.set_output(lines);
         self.status = format!("{} ocorrência(s) encontrada(s).", offsets.len());
-        self.mostrar();
     }
 
-    fn escolher_modo(&mut self) {
-        print("1) HEX");
-        print("2) Texto");
-        let e = ler("Visualização: ");
-        match strip(&e) {
-            "1" => self.hex = true,
-            "2" => self.hex = false,
-            _ => {
-                aviso("Visualização", "Opção inválida.");
-                return;
+    fn update(&mut self, msg: Msg) -> Task<Msg> {
+        match msg {
+            Msg::AbrirArquivo => {
+                let exts = extensoes_dialogo();
+                return Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Abrir arquivo do jogo")
+                            .add_filter("Arquivos suportados", exts.as_slice())
+                            .pick_file()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Msg::ArquivoEscolhido,
+                );
             }
+            Msg::ArquivoEscolhido(Some(p)) => self.load_file(p),
+            Msg::ArquivoEscolhido(None) => {}
+            Msg::AbrirPasta => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Selecionar pasta do jogo")
+                            .pick_folder()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Msg::PastaEscolhida,
+                );
+            }
+            Msg::PastaEscolhida(Some(p)) => self.listar_pasta(p),
+            Msg::PastaEscolhida(None) => {}
+            Msg::Escolher(i) => {
+                let alvo = self
+                    .lista
+                    .as_ref()
+                    .and_then(|l| l.get(i))
+                    .map(|(p, _)| p.clone());
+                if let Some(p) = alvo {
+                    self.load_file(p);
+                }
+            }
+            Msg::CancelarLista => self.lista = None,
+            Msg::Info => self.show_info(),
+            Msg::Strings => self.extract_strings(),
+            Msg::BuscarTexto => self.search_text(),
+            Msg::BuscarHex => self.search_hex(),
+            Msg::Query(q) => self.query = q,
+            Msg::Modo(m) => {
+                self.modo = m;
+                self.render();
+            }
+            Msg::Codificacao(e) => {
+                self.enc = e.0;
+                self.render();
+            }
+            Msg::Nav(n) => {
+                let total = self.total();
+                let max_ini = if total == 0 {
+                    0
+                } else {
+                    ((total - 1) / LINHAS_POR_PAGINA) * LINHAS_POR_PAGINA
+                };
+                self.ini = match n {
+                    Nav::Inicio => 0,
+                    Nav::Anterior => self.ini.saturating_sub(LINHAS_POR_PAGINA),
+                    Nav::Proxima => (self.ini + LINHAS_POR_PAGINA).min(max_ini),
+                    Nav::Fim => max_ini,
+                };
+            }
+            Msg::FecharAviso => self.aviso = None,
         }
-        self.render();
+        Task::none()
     }
 
-    fn escolher_codificacao(&mut self) {
-        for (i, nome) in enumerate(ENCODINGS.iter()) {
-            print(format!("{}) {nome}", i + 1));
-        }
-        let e = ler("Codificação: ");
-        match strip(&e).parse::<usize>() {
-            Ok(n) if n >= 1 && n <= ENCODINGS.len() => self.enc = n - 1,
-            _ => {
-                aviso("Codificação", "Opção inválida.");
-                return;
-            }
-        }
-        self.render();
-    }
+    fn view(&self) -> Element<'_, Msg> {
+        let caminho = match &self.path {
+            Some(p) => p.display().to_string(),
+            None => "Nenhum arquivo aberto".to_string(),
+        };
 
-    fn run(&mut self) {
-        loop {
-            self.cabecalho();
-            let op = ler("Opção: ");
-            match lower(strip(&op)).as_str() {
-                "1" => self.open_file(),
-                "2" => self.open_folder(),
-                "3" => self.show_info(),
-                "4" => self.extract_strings(),
-                "5" => self.escolher_modo(),
-                "6" => self.escolher_codificacao(),
-                "7" => self.search_text(),
-                "8" => self.search_hex(),
-                "9" => self.mostrar(),
-                "0" | "q" | "sair" => break,
-                _ => aviso("Menu", "Opção inválida."),
+        let toolbar = container(
+            row![
+                button("Abrir arquivo").on_press(Msg::AbrirArquivo),
+                button("Abrir pasta").on_press(Msg::AbrirPasta),
+                button("Informações").on_press(Msg::Info),
+                button("Extrair strings").on_press(Msg::Strings),
+                text("Visualização:"),
+                pick_list(&MODOS[..], Some(self.modo), Msg::Modo),
+                text(caminho).width(Fill),
+            ]
+            .spacing(8)
+            .align_y(Vertical::Center),
+        )
+        .padding(8)
+        .width(Fill)
+        .style(container::bordered_box);
+
+        let busca = container(
+            row![
+                text_input("Texto ou HEX: PRINCE / 50 52 49 4E 43 45", &self.query)
+                    .on_input(Msg::Query)
+                    .on_submit(Msg::BuscarTexto)
+                    .width(Fill),
+                button("Buscar texto").on_press(Msg::BuscarTexto),
+                button("Buscar HEX").on_press(Msg::BuscarHex),
+            ]
+            .spacing(8)
+            .align_y(Vertical::Center),
+        )
+        .padding(8)
+        .width(Fill)
+        .style(container::bordered_box);
+
+        let banner: Option<Element<'_, Msg>> = self.aviso.as_ref().map(|(t, m)| {
+            container(
+                column![
+                    text(t.as_str()).size(18),
+                    text(m.as_str()),
+                    button("OK").on_press(Msg::FecharAviso),
+                ]
+                .spacing(6),
+            )
+            .padding(10)
+            .width(Fill)
+            .style(container::bordered_box)
+            .into()
+        });
+
+        let conteudo: Element<'_, Msg> = if let Some(lista) = &self.lista {
+            column![
+                text("Arquivos encontrados").size(18),
+                scrollable(
+                    column(lista.iter().enumerate().map(|(i, (_, rotulo))| {
+                        button(text(rotulo.as_str()).font(Font::MONOSPACE))
+                            .on_press(Msg::Escolher(i))
+                            .width(Fill)
+                            .into()
+                    }))
+                    .spacing(4)
+                )
+                .width(Fill)
+                .height(Fill),
+                button("Cancelar").on_press(Msg::CancelarLista),
+            ]
+            .spacing(8)
+            .height(Fill)
+            .into()
+        } else {
+            let total = self.total();
+            let fim = (self.ini + LINHAS_POR_PAGINA).min(total);
+
+            let corpo = scrollable(
+                text(self.pagina_texto())
+                    .font(Font::MONOSPACE)
+                    .size(13)
+                    .wrapping(text::Wrapping::None),
+            )
+            .direction(scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
+            })
+            .width(Fill)
+            .height(Fill);
+
+            let corpo = container(corpo)
+                .padding(6)
+                .width(Fill)
+                .height(Fill)
+                .style(container::bordered_box);
+
+            let mut coluna = column![corpo].spacing(6).height(Fill);
+
+            if total > LINHAS_POR_PAGINA {
+                let nav: Element<'_, Msg> = row![
+                    button("|<").on_press(Msg::Nav(Nav::Inicio)),
+                    button("<").on_press(Msg::Nav(Nav::Anterior)),
+                    button(">").on_press(Msg::Nav(Nav::Proxima)),
+                    button(">|").on_press(Msg::Nav(Nav::Fim)),
+                    text(format!(
+                        "Linhas {}-{} de {}",
+                        milhares((self.ini + 1) as u64),
+                        milhares(fim as u64),
+                        milhares(total as u64)
+                    )),
+                ]
+                .spacing(8)
+                .align_y(Vertical::Center)
+                .into();
+                coluna = coluna.push(nav);
             }
+
+            coluna.into()
+        };
+
+        let rodape = container(
+            row![
+                text(&self.status).width(Fill),
+                text("Codificação:"),
+                pick_list(&ENCS[..], Some(Enc(self.enc)), Msg::Codificacao),
+            ]
+            .spacing(8)
+            .align_y(Vertical::Center),
+        )
+        .padding(8)
+        .width(Fill)
+        .style(container::bordered_box);
+
+        let mut principal = column![toolbar, busca].spacing(8).padding(10);
+
+        if let Some(b) = banner {
+            principal = principal.push(b);
         }
+
+        principal.push(conteudo).push(rodape).into()
     }
 }
 
-fn main() {
-    let mut app = App::new();
-    app.run();
+fn main() -> iced::Result {
+    iced::application(App::new, App::update, App::view)
+        .title(App::title)
+        .theme(App::theme)
+        .window(iced::window::Settings {
+            size: Size::new(1150.0, 750.0),
+            min_size: Some(Size::new(800.0, 500.0)),
+            ..Default::default()
+        })
+        .run()
 }
